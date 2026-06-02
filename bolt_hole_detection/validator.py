@@ -36,6 +36,9 @@ class TemporalValidator:
         self._candidates: list[CandidateHistory] = []
         self._confirmed_keys: set[tuple[int, int]] = set()
 
+    def reset_candidates(self) -> None:
+        self._candidates.clear()
+
     def validate(self, detections: list[Detection], frame_number: int) -> list[ValidatedDetection]:
         matched: set[int] = set()
         for detection in detections:

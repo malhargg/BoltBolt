@@ -14,7 +14,7 @@ from config import AppConfig, get_logger
 from database import DetectionDatabase
 from detector import create_detector
 from health_monitor import HealthMonitor
-from models import DetectionRecord, FramePacket, RuntimeMetrics, TrackEvent, ValidatedDetection
+from models import Detection, DetectionRecord, FramePacket, RuntimeMetrics, TrackEvent, ValidatedDetection
 from ocr_reader import OCRReader
 from report_manager import ReportManager
 from roi_manager import ROIManager
@@ -26,6 +26,7 @@ from validator import TemporalValidator
 @dataclass
 class DetectionPacket:
     validated_detections: list[ValidatedDetection]
+    bscan_image: np.ndarray
     dst_image: np.ndarray
     frame_number: int
     timestamp: datetime
@@ -39,7 +40,21 @@ class OCREventPacket:
     timestamp: datetime
 
 
+@dataclass(frozen=True)
+class LiveSnapshot:
+    annotated_bscan: np.ndarray | None
+    frame_number: int
+    records: list[dict[str, object]]
+
+
 class BoltHoleProcessor:
+    MOTION_DIFF_THRESHOLD = 10
+    MOTION_CHANGED_RATIO_THRESHOLD = 0.003
+    MOTION_MEAN_DIFF_THRESHOLD = 0.25
+    MOTION_ACTIVE_SECONDS = 2.0
+    DETECTION_MAX_WIDTH = 800
+    LIVE_HOLD_FRAMES = 20
+
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.logger = get_logger("system.processor", config)
@@ -74,6 +89,18 @@ class BoltHoleProcessor:
         self._processing_thread: threading.Thread | None = None
         self._tracking_thread: threading.Thread | None = None
         self._last_ocr_reject_log_frame = -1
+        self._last_motion_frame: np.ndarray | None = None
+        self._last_motion_log_frame = -1
+        self._motion_active_until_frame = -1
+        self._live_lock = threading.RLock()
+        self._latest_annotated_bscan: np.ndarray | None = None
+        self._latest_frame_number = 0
+        self._latest_live_rows: list[dict[str, object]] = []
+        self._latest_distance = ""
+        self._last_visible_detections: list[ValidatedDetection] = []
+        self._last_visible_detection_frame = -1
+        self._detected_hole_count = 0
+        self._known_hole_rows: dict[str, dict[str, object]] = {}
 
     def start(self) -> None:
         if self.state_machine.is_running_state():
@@ -121,7 +148,11 @@ class BoltHoleProcessor:
             self.metrics.frame_queue_size = self.frame_queue.qsize()
             self.metrics.detection_queue_size = self.detection_queue.qsize()
             self.metrics.event_queue_size = self.event_queue.qsize()
-            self.metrics.holes_detected = self.database.count()
+            self.metrics.holes_detected = max(
+                self._detected_hole_count,
+                self.tracker.total_tracks(),
+                self.database.count(),
+            )
             if not self.state_machine.is_running_state():
                 self.metrics.capture_fps = 0.0
                 self.metrics.processing_fps = 0.0
@@ -129,6 +160,25 @@ class BoltHoleProcessor:
                 self.metrics.detection_queue_size = 0
                 self.metrics.event_queue_size = 0
             return RuntimeMetrics(**self.metrics.__dict__)
+
+    def snapshot_live_view(self) -> LiveSnapshot:
+        with self._live_lock:
+            image = None if self._latest_annotated_bscan is None else self._latest_annotated_bscan.copy()
+            frame_number = self._latest_frame_number
+            live_rows = [dict(row) for row in self._latest_live_rows]
+            known_rows = [dict(row) for row in self._known_hole_rows.values()]
+        saved_rows = [
+            {
+                "Bolt Hole": row["hole_id"],
+                "Distance": row["distance"],
+                "Frame": row["frame_number"],
+                "Detection Confidence": round(float(row["detection_confidence"]), 3),
+                "OCR Confidence": round(float(row["ocr_confidence"]), 1),
+            }
+            for row in self.database.fetch_all()
+        ]
+        records = live_rows if live_rows else known_rows if known_rows else saved_rows
+        return LiveSnapshot(image, frame_number, records)
 
     def _drain_queues(self) -> None:
         for q in (self.frame_queue, self.detection_queue, self.event_queue):
@@ -163,16 +213,27 @@ class BoltHoleProcessor:
                 continue
 
             try:
-                if self.state_machine.state == SystemState.CAPTURING:
-                    self.state_machine.transition_to(SystemState.PROCESSING, "first frame received")
                 bscan_image, _ = self.roi_manager.get_bscan_roi(packet.frame)
                 dst_image, _ = self.roi_manager.get_dst_roi(packet.frame)
                 if self.config.debug.enabled and self.config.debug.save_roi_images:
                     self._save_debug_image("bscan_roi", bscan_image, packet.frame_number)
                     self._save_debug_image("dst_roi", dst_image, packet.frame_number)
-                detections = self.detector.detect(bscan_image, packet.frame_number, packet.timestamp)
+                self._should_process_frame(bscan_image, packet.frame_number)
+                if self.state_machine.state == SystemState.CAPTURING:
+                    self.state_machine.transition_to(SystemState.PROCESSING, "B-scan frame received")
+                detection_image, scale = self._resize_for_detection(bscan_image)
+                detections = self._scale_detections(
+                    self.detector.detect(detection_image, packet.frame_number, packet.timestamp),
+                    scale,
+                )
                 validated = self.validator.validate(detections, packet.frame_number)
-                self._put_latest(self.detection_queue, DetectionPacket(validated, dst_image, packet.frame_number, packet.timestamp))
+                if validated:
+                    self._last_visible_detections = validated
+                    self._last_visible_detection_frame = packet.frame_number
+                elif packet.frame_number - self._last_visible_detection_frame <= self.LIVE_HOLD_FRAMES:
+                    validated = self._last_visible_detections
+                self._update_live_bscan(bscan_image, validated, packet.frame_number)
+                self._put_latest(self.detection_queue, DetectionPacket(validated, bscan_image, dst_image, packet.frame_number, packet.timestamp))
                 with self.metrics_lock:
                     self.metrics.frames_processed += 1
                     self.metrics.detections_seen += len(detections)
@@ -189,6 +250,20 @@ class BoltHoleProcessor:
                 continue
             try:
                 events = self.tracker.update(packet.validated_detections, packet.frame_number)
+                if events:
+                    with self.metrics_lock:
+                        self._detected_hole_count = max(self._detected_hole_count, self.tracker.total_tracks())
+                        self.metrics.holes_detected = self._detected_hole_count
+                    with self._live_lock:
+                        for event in events:
+                            self._known_hole_rows[event.track.hole_id] = {
+                                "Bolt Hole": event.track.hole_id,
+                                "Distance": self._latest_distance or "reading...",
+                                "Frame": packet.frame_number,
+                                "Detection Confidence": round(float(event.detection.confidence), 3),
+                                "OCR Confidence": "",
+                            }
+                self._update_live_bscan(packet.bscan_image, packet.validated_detections, packet.frame_number, events)
                 for event in events:
                     if event.is_new:
                         self._put_latest(self.event_queue, OCREventPacket(event, packet.dst_image, packet.frame_number, packet.timestamp))
@@ -214,6 +289,11 @@ class BoltHoleProcessor:
                     self.logger.warning("hole=%s OCR rejected; database insert skipped", packet.event.track.hole_id)
                     self._last_ocr_reject_log_frame = packet.frame_number
                 continue
+            with self._live_lock:
+                self._latest_distance = ocr.text
+                if packet.event.track.hole_id in self._known_hole_rows:
+                    self._known_hole_rows[packet.event.track.hole_id]["Distance"] = ocr.text
+                    self._known_hole_rows[packet.event.track.hole_id]["OCR Confidence"] = round(float(ocr.confidence), 1)
             record = DetectionRecord(
                 hole_id=packet.event.track.hole_id,
                 distance=ocr.text,
@@ -236,6 +316,121 @@ class BoltHoleProcessor:
             except queue.Empty:
                 pass
             q.put_nowait(item)
+
+    def _should_process_frame(self, image: np.ndarray, frame_number: int) -> bool:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
+        sample = cv2.resize(gray, (160, 90), interpolation=cv2.INTER_AREA)
+        previous = self._last_motion_frame
+        self._last_motion_frame = sample
+        if previous is None:
+            return False
+
+        diff = cv2.absdiff(previous, sample)
+        changed_ratio = float(np.mean(diff > self.MOTION_DIFF_THRESHOLD))
+        mean_diff = float(np.mean(diff))
+        has_motion = (
+            changed_ratio >= self.MOTION_CHANGED_RATIO_THRESHOLD
+            or mean_diff >= self.MOTION_MEAN_DIFF_THRESHOLD
+        )
+        if has_motion:
+            grace_frames = int(round(self.config.capture.capture_fps * self.MOTION_ACTIVE_SECONDS))
+            self._motion_active_until_frame = max(self._motion_active_until_frame, frame_number + grace_frames)
+            return True
+        if frame_number <= self._motion_active_until_frame:
+            return True
+        if not has_motion and (frame_number == 1 or frame_number - self._last_motion_log_frame >= 25):
+            self.logger.info(
+                "frame=%s skipped detection because B-scan ROI is static changed_ratio=%.4f mean_diff=%.2f",
+                frame_number,
+                changed_ratio,
+                mean_diff,
+            )
+            self._last_motion_log_frame = frame_number
+        return False
+
+    def _resize_for_detection(self, image: np.ndarray) -> tuple[np.ndarray, float]:
+        height, width = image.shape[:2]
+        if width <= self.DETECTION_MAX_WIDTH:
+            return image, 1.0
+        scale = self.DETECTION_MAX_WIDTH / width
+        resized = cv2.resize(
+            image,
+            (self.DETECTION_MAX_WIDTH, max(1, int(round(height * scale)))),
+            interpolation=cv2.INTER_AREA,
+        )
+        return resized, scale
+
+    def _scale_detections(self, detections: list[Detection], scale: float) -> list[Detection]:
+        if scale == 1.0:
+            return detections
+        scaled: list[Detection] = []
+        for detection in detections:
+            x, y, w, h = detection.bbox
+            scaled.append(
+                Detection(
+                    centroid_x=detection.centroid_x / scale,
+                    centroid_y=detection.centroid_y / scale,
+                    bbox=(
+                        int(round(x / scale)),
+                        int(round(y / scale)),
+                        int(round(w / scale)),
+                        int(round(h / scale)),
+                    ),
+                    area=detection.area / (scale * scale),
+                    confidence=detection.confidence,
+                    frame_number=detection.frame_number,
+                    timestamp=detection.timestamp,
+                )
+            )
+        return scaled
+
+    def _update_live_bscan(
+        self,
+        bscan_image: np.ndarray,
+        validated: list[ValidatedDetection],
+        frame_number: int,
+        events: list[TrackEvent] | None = None,
+    ) -> None:
+        annotated = bscan_image.copy()
+        labels_by_detection: dict[int, str] = {}
+        if events:
+            for event in events:
+                labels_by_detection[id(event.detection)] = event.track.hole_id
+        rows: list[dict[str, object]] = []
+        for index, item in enumerate(validated, start=1):
+            detection = item.detection
+            x, y, w, h = detection.bbox
+            pad = 8
+            x1 = max(0, x - pad)
+            y1 = max(0, y - pad)
+            x2 = min(annotated.shape[1] - 1, x + w + pad)
+            y2 = min(annotated.shape[0] - 1, y + h + pad)
+            label = labels_by_detection.get(id(detection), f"BH{index}")
+            rows.append(
+                {
+                    "Bolt Hole": label,
+                    "Distance": self._latest_distance or "reading...",
+                    "Frame": frame_number,
+                    "Detection Confidence": round(float(detection.confidence), 3),
+                    "OCR Confidence": "",
+                }
+            )
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 255), 2)
+            cv2.putText(
+                annotated,
+                f"{label} {detection.confidence:.2f}",
+                (x1, max(16, y1 - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (255, 0, 255),
+                1,
+                cv2.LINE_AA,
+            )
+        with self._live_lock:
+            self._latest_annotated_bscan = annotated
+            self._latest_frame_number = frame_number
+            if rows or frame_number - self._last_visible_detection_frame > self.LIVE_HOLD_FRAMES:
+                self._latest_live_rows = rows
 
     def _save_debug_image(self, name: str, image: np.ndarray, frame_number: int) -> None:
         path = self.config.paths.debug_dir / f"{frame_number:08d}_{name}.png"

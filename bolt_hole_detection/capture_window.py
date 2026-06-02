@@ -34,6 +34,8 @@ class WindowInfo:
 
 
 class WindowCapture:
+    WINDOW_REFRESH_SECONDS = 1.0
+
     def __init__(self, config: AppConfig, frame_queue: queue.Queue[FramePacket], state_machine: StateMachine) -> None:
         self.config = config
         self.frame_queue = frame_queue
@@ -43,6 +45,7 @@ class WindowCapture:
         self._thread: Optional[threading.Thread] = None
         self._frame_number = 0
         self._last_window: WindowInfo | None = None
+        self._last_window_lookup_at = 0.0
         self._set_dpi_awareness()
 
     def _set_dpi_awareness(self) -> None:
@@ -57,6 +60,12 @@ class WindowCapture:
                 self.logger.warning("Unable to set DPI awareness: %s", exc)
 
     def _find_window(self) -> WindowInfo | None:
+        now = time.perf_counter()
+        if self._last_window is not None and now - self._last_window_lookup_at < self.WINDOW_REFRESH_SECONDS:
+            refreshed = self._refresh_window(self._last_window.hwnd)
+            if refreshed is not None:
+                return refreshed
+        self._last_window_lookup_at = now
         if win32gui is None:
             self.logger.error("pywin32 is required for SRT_BScan window discovery on Windows.")
             return None
@@ -71,10 +80,30 @@ class WindowCapture:
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
             if right - left <= 0 or bottom - top <= 0:
                 return
+            if left < -10000 or top < -10000:
+                return
             matches.append(WindowInfo(hwnd=hwnd, title=title, rect=(left, top, right, bottom)))
 
         win32gui.EnumWindows(enum_handler, None)
         return matches[0] if matches else None
+
+    def _refresh_window(self, hwnd: int) -> WindowInfo | None:
+        if win32gui is None:
+            return self._last_window
+        try:
+            if not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return None
+            title = win32gui.GetWindowText(hwnd)
+            if self.config.window_title.lower() not in title.lower():
+                return None
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            if right - left <= 0 or bottom - top <= 0:
+                return None
+            if left < -10000 or top < -10000:
+                return None
+            return WindowInfo(hwnd=hwnd, title=title, rect=(left, top, right, bottom))
+        except Exception:
+            return None
 
     def _client_capture_rect(self, window: WindowInfo) -> tuple[int, int, int, int] | None:
         if win32gui is None:

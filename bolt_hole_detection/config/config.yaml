@@ -3,28 +3,28 @@ app:
   base_dir: .
 
 capture:
-  capture_fps: 5
+  capture_fps: 20
   reconnect_interval_seconds: 1.0
   dpi_aware: true
 
 processing:
-  process_every_n_frames: 2
+  process_every_n_frames: 1
   empty_queue_sleep_seconds: 0.02
 
 roi:
   bscan:
-    x: 0.02
-    y: 0.12
-    width: 0.76
-    height: 0.70
+    x: 0.028
+    y: 0.585
+    width: 0.322
+    height: 0.175
   dst:
-    x: 0.760
-    y: 0.063
-    width: 0.124
-    height: 0.038
+    x: 0.763
+    y: 0.092
+    width: 0.112
+    height: 0.030
 
 detector:
-  strategy: hybrid
+  strategy: dash_pattern
   min_blob_area: 25
   max_blob_area: 2500
   min_aspect_ratio: 0.35
@@ -39,13 +39,13 @@ detector:
   pair_distance_max: 180
 
 validation:
-  validation_frames: 3
-  spatial_threshold_pixels: 18.0
-  max_missing_frames: 1
+  validation_frames: 1
+  spatial_threshold_pixels: 60.0
+  max_missing_frames: 2
   stale_after_frames: 12
 
 tracker:
-  tracker_distance_threshold: 35.0
+  tracker_distance_threshold: 80.0
   stale_cleanup_frames: 30
   inactive_retention_frames: 500
 
