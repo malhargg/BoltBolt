@@ -13,6 +13,8 @@ class ROIManager:
         self._last_shape: tuple[int, int] | None = None
         self._bscan_roi: PixelROI | None = None
         self._dst_roi: PixelROI | None = None
+        self._location_roi: PixelROI | None = None
+        self._gps_location_roi: PixelROI | None = None
 
     def _calculate(self, rect: RectPercent, width: int, height: int) -> PixelROI:
         x = max(0, int(round(width * rect.x)))
@@ -32,7 +34,9 @@ class ROIManager:
         shape = (height, width)
         self._bscan_roi = self._find_bscan_roi(frame) or self._calculate(self.config.bscan, width, height)
         if shape != self._last_shape or self._dst_roi is None:
-            self._dst_roi = self._calculate(self.config.dst, width, height)
+            self._dst_roi = self._find_top_right_field_roi(frame, field_index=0) or self._calculate(self.config.dst, width, height)
+            self._location_roi = self._calculate(self.config.location, width, height)
+            self._gps_location_roi = self._find_top_right_field_roi(frame, field_index=1) or self._calculate(self.config.gps_location, width, height)
         self._last_shape = shape
 
     def _find_bscan_roi(self, frame: np.ndarray) -> PixelROI | None:
@@ -78,11 +82,50 @@ class ROIManager:
 
         x1 = max(0, int(run_start) - 8)
         x2 = min(width, int(run_end) + 9)
-        y1 = max(0, blue_y - int(height * 0.06))
-        y2 = min(height, red_y + int(height * 0.035))
+        # Keep the crop inside the B-scan plot area. Including the title/header
+        # strip above the top guide line causes text like "Km" and "B Scan" to
+        # be detected as dash clusters.
+        y1 = min(height - 1, blue_y + 3)
+        y2 = max(y1 + 1, min(height, red_y + 6))
         if x2 - x1 < 120 or y2 - y1 < 50:
             return None
         return PixelROI(x=x1, y=y1, width=x2 - x1, height=y2 - y1)
+
+    def _find_top_right_field_roi(self, frame: np.ndarray, field_index: int) -> PixelROI | None:
+        if frame.ndim != 3:
+            return None
+        height, width = frame.shape[:2]
+        search_x = int(width * 0.62)
+        search_y2 = int(height * 0.24)
+        search = frame[:search_y2, search_x:]
+        gray = cv2.cvtColor(search, cv2.COLOR_BGR2GRAY)
+        light = cv2.inRange(gray, 235, 255)
+        contours, _ = cv2.findContours(light, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        candidates: list[tuple[int, int, int, int]] = []
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            abs_x = search_x + x
+            if abs_x < width * 0.70:
+                continue
+            if w < 90 or w > width * 0.22 or h < 12 or h > 38:
+                continue
+            fill_ratio = cv2.contourArea(contour) / max(1, w * h)
+            if fill_ratio < 0.70:
+                continue
+            candidates.append((abs_x, y, w, h))
+
+        if len(candidates) <= field_index:
+            return None
+        candidates.sort(key=lambda item: (item[1], item[0]))
+        x, y, w, h = candidates[field_index]
+        inset = 2
+        return PixelROI(
+            x=min(width - 1, x + inset),
+            y=min(height - 1, y + inset),
+            width=max(1, min(width - x - inset, w - (inset * 2))),
+            height=max(1, min(height - y - inset, h - (inset * 2))),
+        )
 
     @staticmethod
     def _longest_true_run(values: np.ndarray) -> tuple[int, int] | None:
@@ -110,6 +153,16 @@ class ROIManager:
         self.recalculate(frame)
         assert self._dst_roi is not None
         return frame[self._dst_roi.slice()].copy(), self._dst_roi
+
+    def get_location_roi(self, frame: np.ndarray) -> tuple[np.ndarray, PixelROI]:
+        self.recalculate(frame)
+        assert self._location_roi is not None
+        return frame[self._location_roi.slice()].copy(), self._location_roi
+
+    def get_gps_location_roi(self, frame: np.ndarray) -> tuple[np.ndarray, PixelROI]:
+        self.recalculate(frame)
+        assert self._gps_location_roi is not None
+        return frame[self._gps_location_roi.slice()].copy(), self._gps_location_roi
 
     @staticmethod
     def save_roi(path: str, image: np.ndarray) -> None:

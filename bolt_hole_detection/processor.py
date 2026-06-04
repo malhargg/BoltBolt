@@ -28,6 +28,8 @@ class DetectionPacket:
     validated_detections: list[ValidatedDetection]
     bscan_image: np.ndarray
     dst_image: np.ndarray
+    location_image: np.ndarray
+    gps_location_image: np.ndarray
     frame_number: int
     timestamp: datetime
 
@@ -36,6 +38,8 @@ class DetectionPacket:
 class OCREventPacket:
     event: TrackEvent
     dst_image: np.ndarray
+    location_image: np.ndarray
+    gps_location_image: np.ndarray
     frame_number: int
     timestamp: datetime
 
@@ -97,6 +101,8 @@ class BoltHoleProcessor:
         self._latest_frame_number = 0
         self._latest_live_rows: list[dict[str, object]] = []
         self._latest_distance = ""
+        self._latest_location = ""
+        self._latest_gps_location = ""
         self._last_visible_detections: list[ValidatedDetection] = []
         self._last_visible_detection_frame = -1
         self._detected_hole_count = 0
@@ -170,6 +176,8 @@ class BoltHoleProcessor:
         saved_rows = [
             {
                 "Bolt Hole": row["hole_id"],
+                "Location": row["location"],
+                "GPS Location": row["gps_location"],
                 "Distance": row["distance"],
                 "Frame": row["frame_number"],
                 "Detection Confidence": round(float(row["detection_confidence"]), 3),
@@ -215,12 +223,22 @@ class BoltHoleProcessor:
             try:
                 bscan_image, _ = self.roi_manager.get_bscan_roi(packet.frame)
                 dst_image, _ = self.roi_manager.get_dst_roi(packet.frame)
+                location_image, _ = self.roi_manager.get_location_roi(packet.frame)
+                gps_location_image, _ = self.roi_manager.get_gps_location_roi(packet.frame)
                 if self.config.debug.enabled and self.config.debug.save_roi_images:
                     self._save_debug_image("bscan_roi", bscan_image, packet.frame_number)
                     self._save_debug_image("dst_roi", dst_image, packet.frame_number)
-                self._should_process_frame(bscan_image, packet.frame_number)
+                    self._save_debug_image("location_roi", location_image, packet.frame_number)
+                    self._save_debug_image("gps_location_roi", gps_location_image, packet.frame_number)
                 if self.state_machine.state == SystemState.CAPTURING:
                     self.state_machine.transition_to(SystemState.PROCESSING, "B-scan frame received")
+                should_detect = self._should_process_frame(bscan_image, packet.frame_number)
+                if not should_detect:
+                    self.validator.validate([], packet.frame_number)
+                    self._update_live_bscan(bscan_image, [], packet.frame_number)
+                    with self.metrics_lock:
+                        self.metrics.frames_processed += 1
+                    continue
                 detection_image, scale = self._resize_for_detection(bscan_image)
                 detections = self._scale_detections(
                     self.detector.detect(detection_image, packet.frame_number, packet.timestamp),
@@ -233,7 +251,18 @@ class BoltHoleProcessor:
                 elif packet.frame_number - self._last_visible_detection_frame <= self.LIVE_HOLD_FRAMES:
                     validated = self._last_visible_detections
                 self._update_live_bscan(bscan_image, validated, packet.frame_number)
-                self._put_latest(self.detection_queue, DetectionPacket(validated, bscan_image, dst_image, packet.frame_number, packet.timestamp))
+                self._put_latest(
+                    self.detection_queue,
+                    DetectionPacket(
+                        validated,
+                        bscan_image,
+                        dst_image,
+                        location_image,
+                        gps_location_image,
+                        packet.frame_number,
+                        packet.timestamp,
+                    ),
+                )
                 with self.metrics_lock:
                     self.metrics.frames_processed += 1
                     self.metrics.detections_seen += len(detections)
@@ -256,17 +285,33 @@ class BoltHoleProcessor:
                         self.metrics.holes_detected = self._detected_hole_count
                     with self._live_lock:
                         for event in events:
-                            self._known_hole_rows[event.track.hole_id] = {
-                                "Bolt Hole": event.track.hole_id,
-                                "Distance": self._latest_distance or "reading...",
-                                "Frame": packet.frame_number,
-                                "Detection Confidence": round(float(event.detection.confidence), 3),
-                                "OCR Confidence": "",
-                            }
+                            self._known_hole_rows.setdefault(
+                                event.track.hole_id,
+                                {
+                                    "Bolt Hole": event.track.hole_id,
+                                    "Location": "",
+                                    "GPS Location": "",
+                                    "Distance": "reading..." if self.ocr_reader.available else "OCR unavailable",
+                                    "Frame": packet.frame_number,
+                                    "Detection Confidence": round(float(event.detection.confidence), 3),
+                                    "OCR Confidence": "",
+                                },
+                            )
+                    self.logger.info("tracking candidates=%s frame=%s awaiting location OCR", len(events), packet.frame_number)
                 self._update_live_bscan(packet.bscan_image, packet.validated_detections, packet.frame_number, events)
                 for event in events:
                     if event.is_new:
-                        self._put_latest(self.event_queue, OCREventPacket(event, packet.dst_image, packet.frame_number, packet.timestamp))
+                        self._put_latest(
+                            self.event_queue,
+                            OCREventPacket(
+                                event,
+                                packet.dst_image,
+                                packet.location_image,
+                                packet.gps_location_image,
+                                packet.frame_number,
+                                packet.timestamp,
+                            ),
+                        )
                 self._consume_ocr_events()
             except Exception as exc:
                 self.logger.exception("Tracking/OCR loop failed: %s", exc)
@@ -279,33 +324,56 @@ class BoltHoleProcessor:
                 packet = self.event_queue.get_nowait()
             except queue.Empty:
                 return
-            ocr = self.ocr_reader.read_distance(packet.dst_image, packet.frame_number)
+            distance_ocr = self.ocr_reader.read_distance(packet.dst_image, packet.frame_number)
+            gps_ocr = self.ocr_reader.read_gps_location(packet.gps_location_image, packet.frame_number)
             with self.metrics_lock:
                 self.metrics.ocr_events += 1
-            if not ocr.accepted:
+            if not distance_ocr.accepted:
                 if not self.ocr_reader.available:
                     continue
+                with self._live_lock:
+                    row = self._known_hole_rows.get(packet.event.track.hole_id)
+                    if row is not None:
+                        row["Distance"] = "unreadable"
+                        row["OCR Confidence"] = round(float(distance_ocr.confidence), 1)
                 if packet.frame_number - self._last_ocr_reject_log_frame >= 25:
-                    self.logger.warning("hole=%s OCR rejected; database insert skipped", packet.event.track.hole_id)
+                    self.logger.warning("hole=%s distance OCR rejected; database insert skipped", packet.event.track.hole_id)
                     self._last_ocr_reject_log_frame = packet.frame_number
                 continue
             with self._live_lock:
-                self._latest_distance = ocr.text
-                if packet.event.track.hole_id in self._known_hole_rows:
-                    self._known_hole_rows[packet.event.track.hole_id]["Distance"] = ocr.text
-                    self._known_hole_rows[packet.event.track.hole_id]["OCR Confidence"] = round(float(ocr.confidence), 1)
+                self._latest_distance = distance_ocr.text
+                if gps_ocr.text:
+                    self._latest_gps_location = gps_ocr.text
+                self._known_hole_rows[packet.event.track.hole_id] = {
+                    "Bolt Hole": packet.event.track.hole_id,
+                    "Location": "",
+                    "GPS Location": gps_ocr.text,
+                    "Distance": distance_ocr.text,
+                    "Frame": packet.frame_number,
+                    "Detection Confidence": round(float(packet.event.detection.confidence), 3),
+                    "OCR Confidence": round(float(distance_ocr.confidence), 1),
+                }
             record = DetectionRecord(
                 hole_id=packet.event.track.hole_id,
-                distance=ocr.text,
+                distance=distance_ocr.text,
+                location="",
+                gps_location=gps_ocr.text,
                 frame_number=packet.frame_number,
                 detection_confidence=packet.event.detection.confidence,
-                ocr_confidence=ocr.confidence,
+                ocr_confidence=distance_ocr.confidence,
                 timestamp=packet.timestamp,
             )
             inserted = self.database.insert_detection(record)
             with self.metrics_lock:
-                self.metrics.holes_detected = self.database.count()
-            self.logger.info("hole=%s distance=%s inserted=%s", record.hole_id, record.distance, inserted)
+                self._detected_hole_count = self.database.count()
+                self.metrics.holes_detected = self._detected_hole_count
+            self.logger.info(
+                "hole=%s distance=%s gps_location=%s inserted=%s",
+                record.hole_id,
+                record.distance,
+                record.gps_location,
+                inserted,
+            )
 
     def _put_latest(self, q: queue.Queue, item: object) -> None:
         try:
@@ -406,15 +474,6 @@ class BoltHoleProcessor:
             x2 = min(annotated.shape[1] - 1, x + w + pad)
             y2 = min(annotated.shape[0] - 1, y + h + pad)
             label = labels_by_detection.get(id(detection), f"BH{index}")
-            rows.append(
-                {
-                    "Bolt Hole": label,
-                    "Distance": self._latest_distance or "reading...",
-                    "Frame": frame_number,
-                    "Detection Confidence": round(float(detection.confidence), 3),
-                    "OCR Confidence": "",
-                }
-            )
             cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 0, 255), 2)
             cv2.putText(
                 annotated,

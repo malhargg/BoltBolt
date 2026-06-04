@@ -19,11 +19,13 @@ class ReportManager:
         report_path = self.reports_dir / (filename or f"bolt_hole_report_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.csv")
         with report_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["Hole ID", "Distance", "Detection Confidence", "OCR Confidence", "Timestamp"])
+            writer.writerow(["Hole ID", "Location", "GPS Location", "Distance", "Detection Confidence", "OCR Confidence", "Timestamp"])
             for row in rows:
                 writer.writerow(
                     [
                         row["hole_id"],
+                        row["location"],
+                        row["gps_location"],
                         row["distance"],
                         f"{float(row['detection_confidence']):.4f}",
                         f"{float(row['ocr_confidence']):.2f}",

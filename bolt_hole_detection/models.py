@@ -73,6 +73,8 @@ class OCROutput:
 class DetectionRecord:
     hole_id: str
     distance: str
+    location: str
+    gps_location: str
     frame_number: int
     detection_confidence: float
     ocr_confidence: float

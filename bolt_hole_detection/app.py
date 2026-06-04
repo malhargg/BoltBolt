@@ -61,7 +61,7 @@ def render_live_metrics() -> None:
     status_cols = st.columns(6)
     status_cols[0].metric("Current State", current_state.value)
     status_cols[1].metric("Frames Processed", metrics.frames_processed)
-    status_cols[2].metric("Holes Detected", metrics.holes_detected)
+    status_cols[2].metric("Visual Holes", metrics.holes_detected)
     status_cols[3].metric("Capture FPS", f"{metrics.capture_fps:.2f}")
     status_cols[4].metric("Processing FPS", f"{metrics.processing_fps:.2f}")
     status_cols[5].metric("OCR Events", metrics.ocr_events)

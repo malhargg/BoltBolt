@@ -217,11 +217,16 @@ class WindowCapture:
                     continue
                 left, top, right, bottom = capture_rect
                 try:
-                    frame = self._capture_with_printwindow(window)
-                    if frame is None:
-                        monitor = {"left": left, "top": top, "width": right - left, "height": bottom - top}
+                    monitor = {"left": left, "top": top, "width": right - left, "height": bottom - top}
+                    if self._is_foreground_window(window):
                         raw = np.asarray(sct.grab(monitor))
                         frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
+                    else:
+                        frame = self._capture_with_printwindow(window)
+                        if frame is None:
+                            self._bring_window_to_front(window)
+                            raw = np.asarray(sct.grab(monitor))
+                            frame = cv2.cvtColor(raw, cv2.COLOR_BGRA2BGR)
                     self._frame_number += 1
                     self._put_latest(FramePacket(frame, self._frame_number, datetime.utcnow(), capture_rect))
                 except Exception as exc:
@@ -231,3 +236,21 @@ class WindowCapture:
 
                 elapsed = time.perf_counter() - start
                 time.sleep(max(0.0, interval - elapsed))
+
+    def _bring_window_to_front(self, window: WindowInfo) -> None:
+        if win32gui is None:
+            return
+        try:
+            if win32gui.IsIconic(window.hwnd):
+                win32gui.ShowWindow(window.hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(window.hwnd)
+        except Exception as exc:
+            self.logger.warning("Unable to focus SRT_BScan before screen fallback: %s", exc)
+
+    def _is_foreground_window(self, window: WindowInfo) -> bool:
+        if win32gui is None:
+            return True
+        try:
+            return win32gui.GetForegroundWindow() == window.hwnd
+        except Exception:
+            return False

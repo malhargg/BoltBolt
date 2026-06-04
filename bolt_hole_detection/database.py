@@ -29,6 +29,8 @@ class DetectionDatabase:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     hole_id TEXT NOT NULL UNIQUE,
                     distance TEXT NOT NULL,
+                    location TEXT NOT NULL DEFAULT '',
+                    gps_location TEXT NOT NULL DEFAULT '',
                     frame_number INTEGER NOT NULL,
                     detection_confidence REAL NOT NULL,
                     ocr_confidence REAL NOT NULL,
@@ -36,7 +38,10 @@ class DetectionDatabase:
                 )
                 """
             )
+            self._ensure_column(conn, "location", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "gps_location", "TEXT NOT NULL DEFAULT ''")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_detections_distance ON detections(distance)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_detections_location ON detections(location)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_detections_timestamp ON detections(timestamp)")
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_detections_unique_distance "
@@ -44,17 +49,24 @@ class DetectionDatabase:
             )
             conn.commit()
 
+    def _ensure_column(self, conn: sqlite3.Connection, name: str, definition: str) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(detections)")}
+        if name not in columns:
+            conn.execute(f"ALTER TABLE detections ADD COLUMN {name} {definition}")
+
     def insert_detection(self, record: DetectionRecord) -> bool:
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT OR IGNORE INTO detections
-                (hole_id, distance, frame_number, detection_confidence, ocr_confidence, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (hole_id, distance, location, gps_location, frame_number, detection_confidence, ocr_confidence, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     record.hole_id,
                     record.distance,
+                    record.location,
+                    record.gps_location,
                     record.frame_number,
                     record.detection_confidence,
                     record.ocr_confidence,

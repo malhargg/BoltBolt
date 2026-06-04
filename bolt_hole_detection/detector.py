@@ -159,7 +159,7 @@ class DashPatternDetector(BaseDetector):
         self._save_debug("dash_pattern_mask", mask, frame_number)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        strokes: list[tuple[int, int, int, int]] = []
+        strokes: list[tuple[int, int, int, int, str]] = []
         image_height, image_width = image.shape[:2]
         for contour in contours:
             x, y, w, h = cv2.boundingRect(contour)
@@ -175,22 +175,24 @@ class DashPatternDetector(BaseDetector):
             # Ignore the long blue/red B-scan guide lines and border fragments.
             if w > image_width * 0.06:
                 continue
-            strokes.append((x, y, w, h))
+            color_name = self._stroke_color(image, x, y, w, h)
+            strokes.append((x, y, w, h, color_name))
 
         clusters = self._cluster_strokes(strokes)
         detections: list[Detection] = []
         for cluster in clusters:
             if len(cluster) < 2:
                 continue
-            x1 = min(x for x, _, _, _ in cluster)
-            y1 = min(y for _, y, _, _ in cluster)
-            x2 = max(x + w for x, y, w, h in cluster)
-            y2 = max(y + h for x, y, w, h in cluster)
+            colors = {color for *_, color in cluster if color != "other"}
+            x1 = min(x for x, _, _, _, _ in cluster)
+            y1 = min(y for _, y, _, _, _ in cluster)
+            x2 = max(x + w for x, y, w, h, _ in cluster)
+            y2 = max(y + h for x, y, w, h, _ in cluster)
             width = x2 - x1
             height = y2 - y1
-            if width < 10 or width > 110 or height > 55:
+            if width < 6 or width > 105 or height > 55:
                 continue
-            confidence = min(0.95, 0.45 + (0.10 * len(cluster)))
+            confidence = min(0.95, 0.55 + (0.08 * len(cluster)) + (0.04 * min(len(colors), 2)))
             detections.append(
                 Detection(
                     centroid_x=x1 + width / 2.0,
@@ -202,6 +204,7 @@ class DashPatternDetector(BaseDetector):
                     timestamp=timestamp,
                 )
             )
+        detections = self._dedupe_detections(detections)
         self._log_count(frame_number, "dash_pattern", len(detections))
         return detections
 
@@ -220,43 +223,88 @@ class DashPatternDetector(BaseDetector):
                     continue
                 blue_y = int(blue_candidates[-1])
                 red_y = int(red_y_raw)
-                return min(image.shape[0] - 4, blue_y + 2), max(4, red_y - 2)
+                return min(image.shape[0] - 4, blue_y + 8), max(4, red_y - 4)
         return int(image.shape[0] * 0.30), int(image.shape[0] * 0.86)
 
-    def _cluster_strokes(self, strokes: list[tuple[int, int, int, int]]) -> list[list[tuple[int, int, int, int]]]:
-        clusters: list[list[tuple[int, int, int, int]]] = []
+    def _stroke_color(self, image: np.ndarray, x: int, y: int, w: int, h: int) -> str:
+        if image.ndim != 3:
+            return "gray"
+        crop = image[y : y + h, x : x + w]
+        if crop.size == 0:
+            return "other"
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        hue = float(np.median(hsv[:, :, 0]))
+        saturation = float(np.median(hsv[:, :, 1]))
+        value = float(np.median(hsv[:, :, 2]))
+        if saturation < 120 and 45 <= value <= 235:
+            return "gray"
+        if hue <= 12 or hue >= 168:
+            return "red"
+        if 122 <= hue <= 162:
+            return "purple"
+        # SRT renders the "gray" echo as muted olive/khaki pixels, not neutral
+        # grayscale, so accept that family as the same bolt-hole color.
+        if 35 <= hue <= 95 and 40 <= saturation <= 190 and 45 <= value <= 235:
+            return "gray"
+        return "other"
+
+    def _cluster_strokes(self, strokes: list[tuple[int, int, int, int, str]]) -> list[list[tuple[int, int, int, int, str]]]:
+        clusters: list[list[tuple[int, int, int, int, str]]] = []
         for stroke in sorted(strokes, key=lambda item: item[0]):
-            sx, sy, sw, sh = stroke
+            sx, sy, sw, sh, _ = stroke
             scx = sx + sw / 2.0
             scy = sy + sh / 2.0
-            best_cluster: list[tuple[int, int, int, int]] | None = None
-            best_distance = float("inf")
+            best_cluster: list[tuple[int, int, int, int, str]] | None = None
+            best_gap = float("inf")
             for cluster in clusters:
-                centers = [(x + w / 2.0, y + h / 2.0) for x, y, w, h in cluster]
-                cx = sum(x for x, _ in centers) / len(centers)
-                cy = sum(y for _, y in centers) / len(centers)
-                distance = math.hypot(scx - cx, scy - cy)
-                if abs(scx - cx) <= 45 and abs(scy - cy) <= 24 and distance < best_distance:
+                x1 = min(x for x, _, _, _, _ in cluster)
+                y1 = min(y for _, y, _, _, _ in cluster)
+                x2 = max(x + w for x, y, w, h, _ in cluster)
+                y2 = max(y + h for x, y, w, h, _ in cluster)
+                gap = max(x1 - (sx + sw), sx - x2, 0)
+                vertical_overlap = min(sy + sh, y2) - max(sy, y1)
+                close_y = abs(scy - ((y1 + y2) / 2.0)) <= 24
+                cluster_width = max(x2, sx + sw) - min(x1, sx)
+                if gap <= 38 and cluster_width <= 105 and (vertical_overlap >= -8 or close_y) and gap < best_gap:
                     best_cluster = cluster
-                    best_distance = distance
+                    best_gap = gap
             if best_cluster is None:
                 clusters.append([stroke])
             else:
                 best_cluster.append(stroke)
         return clusters
 
+    def _dedupe_detections(self, detections: list[Detection]) -> list[Detection]:
+        kept: list[Detection] = []
+        for detection in sorted(detections, key=lambda item: item.confidence, reverse=True):
+            if any(
+                math.hypot(detection.centroid_x - existing.centroid_x, detection.centroid_y - existing.centroid_y) < 20
+                for existing in kept
+            ):
+                continue
+            kept.append(detection)
+        return sorted(kept, key=lambda item: item.centroid_x)
+
 
 class HybridDetector(BaseDetector):
     def __init__(self, config: AppConfig) -> None:
         super().__init__(config)
+        self._dash = DashPatternDetector(config)
         self._contour = ContourDetector(config)
         self._blob = BlobDetector(config)
 
     def detect(self, image: np.ndarray, frame_number: int, timestamp: datetime) -> list[Detection]:
-        candidates = self._contour.detect(image, frame_number, timestamp) + self._blob.detect(image, frame_number, timestamp)
+        candidates = (
+            self._dash.detect(image, frame_number, timestamp)
+            + self._contour.detect(image, frame_number, timestamp)
+            + self._blob.detect(image, frame_number, timestamp)
+        )
         merged: list[Detection] = []
         for candidate in sorted(candidates, key=lambda d: d.confidence, reverse=True):
-            if any(math.hypot(candidate.centroid_x - existing.centroid_x, candidate.centroid_y - existing.centroid_y) < 8 for existing in merged):
+            if any(
+                math.hypot(candidate.centroid_x - existing.centroid_x, candidate.centroid_y - existing.centroid_y) < 12
+                for existing in merged
+            ):
                 continue
             merged.append(candidate)
         self._log_count(frame_number, "hybrid", len(merged))

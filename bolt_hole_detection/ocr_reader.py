@@ -13,6 +13,8 @@ from models import OCROutput
 
 class OCRReader:
     DISTANCE_PATTERN = re.compile(r"\d{3,5}:\d{3,5}:\d{3,5}")
+    DECIMAL_DISTANCE_PATTERN = re.compile(r"\d+(?:\.\d+)?")
+    GPS_PATTERN = re.compile(r"\d{1,3}\s*[°º']?\s*\d{1,3}[']?\s*\d{1,3}(?:\.\d+)?[\"']?\s*[NSEW]", re.IGNORECASE)
 
     def __init__(self, config: AppConfig) -> None:
         self.config = config
@@ -29,15 +31,73 @@ class OCRReader:
         max_variants = min(len(variants), max(1, self.config.ocr.retry_attempts) * 3)
         for attempt, processed in enumerate(variants[:max_variants]):
             if self.config.debug.enabled and self.config.debug.save_ocr_crops:
+                cv2.imwrite(str(self.config.paths.debug_dir / f"{frame_number:08d}_distance_ocr_{attempt}.png"), processed)
+            output = self._run_tesseract(
+                processed,
+                whitelist="0123456789:.",
+                pattern=None,
+            )
+            clean = self._clean_distance_text(output.text)
+            result = OCROutput(
+                text=clean,
+                confidence=output.confidence,
+                accepted=bool(clean) and output.confidence >= self.config.ocr.ocr_confidence_threshold,
+            )
+            if result.confidence > best.confidence:
+                best = result
+            if result.accepted:
+                self.logger.info("frame=%s distance_text=%s confidence=%.2f", frame_number, result.text, result.confidence)
+                return result
+        self.logger.warning("frame=%s distance OCR rejected best_text=%s confidence=%.2f", frame_number, best.text, best.confidence)
+        return best
+
+    def read_location(self, image: np.ndarray, frame_number: int) -> OCROutput:
+        if not self._available:
+            return OCROutput(text="", confidence=0.0, accepted=False)
+        best = OCROutput(text="", confidence=0.0, accepted=False)
+        variants = self._preprocess_variants(image)
+        max_variants = min(len(variants), max(1, self.config.ocr.retry_attempts) * 3)
+        for attempt, processed in enumerate(variants[:max_variants]):
+            if self.config.debug.enabled and self.config.debug.save_ocr_crops:
                 cv2.imwrite(str(self.config.paths.debug_dir / f"{frame_number:08d}_ocr_{attempt}.png"), processed)
-            output = self._run_tesseract(processed)
+            output = self._run_tesseract(
+                processed,
+                whitelist="0123456789:",
+                pattern=self.DISTANCE_PATTERN,
+            )
             if output.confidence > best.confidence:
                 best = output
             if output.accepted:
-                self.logger.info("frame=%s ocr_text=%s confidence=%.2f", frame_number, output.text, output.confidence)
+                self.logger.info("frame=%s location_text=%s confidence=%.2f", frame_number, output.text, output.confidence)
                 return output
-        self.logger.warning("frame=%s OCR rejected best_text=%s confidence=%.2f", frame_number, best.text, best.confidence)
+        self.logger.warning("frame=%s location OCR rejected best_text=%s confidence=%.2f", frame_number, best.text, best.confidence)
         return best
+
+    def read_gps_location(self, image: np.ndarray, frame_number: int) -> OCROutput:
+        if not self._available:
+            return OCROutput(text="", confidence=0.0, accepted=False)
+        best = OCROutput(text="", confidence=0.0, accepted=False)
+        variants = self._preprocess_variants(image)
+        max_variants = min(len(variants), max(1, self.config.ocr.retry_attempts) * 3)
+        for attempt, processed in enumerate(variants[:max_variants]):
+            if self.config.debug.enabled and self.config.debug.save_ocr_crops:
+                cv2.imwrite(str(self.config.paths.debug_dir / f"{frame_number:08d}_gps_ocr_{attempt}.png"), processed)
+            output = self._run_tesseract(
+                processed,
+                whitelist="0123456789NSEWnsew.:'°º",
+                pattern=None,
+            )
+            if output.confidence > best.confidence:
+                best = output
+            if output.text and output.confidence >= self.config.ocr.ocr_confidence_threshold:
+                clean = self._clean_gps_text(output.text)
+                accepted = bool(clean)
+                result = OCROutput(text=clean, confidence=output.confidence, accepted=accepted)
+                if accepted:
+                    self.logger.info("frame=%s gps_location_text=%s confidence=%.2f", frame_number, result.text, result.confidence)
+                    return result
+        self.logger.warning("frame=%s GPS OCR rejected best_text=%s confidence=%.2f", frame_number, best.text, best.confidence)
+        return OCROutput(text=self._clean_gps_text(best.text), confidence=best.confidence, accepted=False)
 
     def _check_tesseract_available(self) -> bool:
         try:
@@ -67,8 +127,14 @@ class OCRReader:
         inverted = cv2.bitwise_not(otsu)
         return [sharpened, enhanced, otsu, adaptive, inverted]
 
-    def _run_tesseract(self, image: np.ndarray) -> OCROutput:
-        config = f"--oem 3 --psm {self.config.ocr.psm} -c tessedit_char_whitelist={self.config.ocr.whitelist}"
+    def _run_tesseract(
+        self,
+        image: np.ndarray,
+        whitelist: str | None = None,
+        pattern: re.Pattern[str] | None = None,
+    ) -> OCROutput:
+        chars = whitelist if whitelist is not None else self.config.ocr.whitelist
+        config = f"--oem 3 --psm {self.config.ocr.psm} -c tessedit_char_whitelist={chars}"
         try:
             data = pytesseract.image_to_data(image, config=config, output_type=pytesseract.Output.DICT)
         except Exception as exc:
@@ -88,8 +154,22 @@ class OCRReader:
             if confidence >= 0:
                 confidences.append(confidence)
         joined = "".join(words).replace(" ", "")
-        match = self.DISTANCE_PATTERN.search(joined)
+        match = pattern.search(joined) if pattern is not None else None
         clean_text = match.group(0) if match else joined
         avg_confidence = sum(confidences) / len(confidences) if confidences else 0.0
-        accepted = bool(match) and avg_confidence >= self.config.ocr.ocr_confidence_threshold
+        accepted = (bool(match) if pattern is not None else bool(clean_text)) and avg_confidence >= self.config.ocr.ocr_confidence_threshold
         return OCROutput(text=clean_text, confidence=avg_confidence, accepted=accepted)
+
+    def _clean_gps_text(self, text: str) -> str:
+        clean = " ".join(text.replace("|", " ").split())
+        matches = self.GPS_PATTERN.findall(clean)
+        return " ".join(matches) if matches else clean
+
+    def _clean_distance_text(self, text: str) -> str:
+        clean = text.replace("O", "0").replace("o", "0").replace(",", ".")
+        clean = "".join(ch for ch in clean if ch.isdigit() or ch in {":", "."})
+        colon_match = self.DISTANCE_PATTERN.search(clean)
+        if colon_match:
+            return colon_match.group(0)
+        decimal_match = self.DECIMAL_DISTANCE_PATTERN.search(clean)
+        return decimal_match.group(0) if decimal_match else ""

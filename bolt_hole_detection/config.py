@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
 from pathlib import Path
@@ -97,6 +98,8 @@ class ProcessingConfig:
 class ROIConfig:
     bscan: RectPercent
     dst: RectPercent
+    location: RectPercent
+    gps_location: RectPercent
 
 
 @dataclass(frozen=True)
@@ -191,10 +194,11 @@ class AppConfig:
 
     @classmethod
     def load(cls, config_path: str | Path | None = None) -> "AppConfig":
-        root_dir = Path(__file__).resolve().parent
-        path = Path(config_path) if config_path else root_dir / "config" / "config.yaml"
+        resource_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        runtime_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+        path = Path(config_path) if config_path else resource_dir / "config" / "config.yaml"
         raw = _load_yaml(path)
-        base_dir = (root_dir / str(raw.get("app", {}).get("base_dir", "."))).resolve()
+        base_dir = (runtime_dir / str(raw.get("app", {}).get("base_dir", "."))).resolve()
 
         def section(name: str) -> dict[str, Any]:
             value = raw.get(name, {})
@@ -205,8 +209,12 @@ class AppConfig:
         roi_raw = section("roi")
         bscan = RectPercent(**roi_raw["bscan"])
         dst = RectPercent(**roi_raw["dst"])
+        location = RectPercent(**roi_raw.get("location", roi_raw["dst"]))
+        gps_location = RectPercent(**roi_raw.get("gps_location", roi_raw["dst"]))
         bscan.validate("BScan")
         dst.validate("DST")
+        location.validate("Location")
+        gps_location.validate("GPS location")
 
         paths_raw = section("paths")
         paths = PathConfig(
@@ -221,7 +229,7 @@ class AppConfig:
             base_dir=base_dir,
             capture=CaptureConfig(**section("capture")),
             processing=ProcessingConfig(**section("processing")),
-            roi=ROIConfig(bscan=bscan, dst=dst),
+            roi=ROIConfig(bscan=bscan, dst=dst, location=location, gps_location=gps_location),
             detector=DetectorConfig(**section("detector")),
             validation=ValidationConfig(**section("validation")),
             tracker=TrackerConfig(**section("tracker")),

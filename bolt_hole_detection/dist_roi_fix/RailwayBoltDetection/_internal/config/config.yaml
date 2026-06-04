@@ -1,0 +1,92 @@
+app:
+  window_title: SRT_BScan
+  base_dir: .
+
+capture:
+  capture_fps: 20
+  reconnect_interval_seconds: 1.0
+  dpi_aware: true
+
+processing:
+  process_every_n_frames: 1
+  empty_queue_sleep_seconds: 0.02
+
+roi:
+  bscan:
+    x: 0.028
+    y: 0.585
+    width: 0.322
+    height: 0.175
+  dst:
+    x: 0.765
+    y: 0.065
+    width: 0.115
+    height: 0.032
+  location:
+    x: 0.765
+    y: 0.065
+    width: 0.115
+    height: 0.032
+  gps_location:
+    x: 0.765
+    y: 0.123
+    width: 0.135
+    height: 0.034
+
+detector:
+  strategy: dash_pattern
+  min_blob_area: 25
+  max_blob_area: 2500
+  min_aspect_ratio: 0.35
+  max_aspect_ratio: 2.80
+  min_solidity: 0.45
+  gaussian_kernel: 5
+  adaptive_block_size: 31
+  adaptive_c: 5
+  morphology_kernel: 3
+  min_confidence: 0.35
+  pair_distance_min: 6
+  pair_distance_max: 180
+
+validation:
+  validation_frames: 2
+  spatial_threshold_pixels: 60.0
+  max_missing_frames: 2
+  stale_after_frames: 12
+
+tracker:
+  tracker_distance_threshold: 80.0
+  stale_cleanup_frames: 30
+  inactive_retention_frames: 500
+
+ocr:
+  ocr_confidence_threshold: 10.0
+  retry_attempts: 2
+  tesseract_cmd: "C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
+  whitelist: "0123456789:"
+  psm: 7
+  scale_factor: 2.0
+
+queues:
+  frame_queue_size: 8
+  detection_queue_size: 16
+  event_queue_size: 16
+
+paths:
+  database: database/detections.db
+  reports_dir: reports
+  logs_dir: logs
+  debug_dir: debug
+
+debug:
+  enabled: false
+  save_roi_images: true
+  save_threshold_images: true
+  save_contour_images: true
+  save_ocr_crops: true
+  max_debug_files: 500
+
+logging:
+  max_bytes: 5242880
+  backup_count: 5
+  health_log_interval_seconds: 10.0

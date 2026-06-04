@@ -42,7 +42,7 @@ class TemporalValidator:
     def validate(self, detections: list[Detection], frame_number: int) -> list[ValidatedDetection]:
         matched: set[int] = set()
         for detection in detections:
-            index = self._find_candidate(detection)
+            index = self._find_candidate(detection, matched)
             if index is None:
                 candidate = CandidateHistory(
                     centroid_x=detection.centroid_x,
@@ -77,11 +77,16 @@ class TemporalValidator:
         self._cleanup(frame_number)
         return confirmed
 
-    def _find_candidate(self, detection: Detection) -> int | None:
+    def _find_candidate(self, detection: Detection, excluded_indexes: set[int] | None = None) -> int | None:
         best_index: int | None = None
         best_distance = float("inf")
+        excluded_indexes = excluded_indexes or set()
         for index, candidate in enumerate(self._candidates):
+            if index in excluded_indexes:
+                continue
             if detection.frame_number - candidate.last_frame > self.config.max_missing_frames + 1:
+                continue
+            if detection.frame_number == candidate.last_frame:
                 continue
             distance = math.hypot(detection.centroid_x - candidate.centroid_x, detection.centroid_y - candidate.centroid_y)
             if distance <= self.config.spatial_threshold_pixels and distance < best_distance:

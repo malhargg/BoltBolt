@@ -19,9 +19,10 @@ class CentroidTracker:
     def update(self, detections: list[ValidatedDetection], frame_number: int) -> list[TrackEvent]:
         events: list[TrackEvent] = []
         with self._lock:
+            used_track_ids: set[str] = set()
             for validated in detections:
                 detection = validated.detection
-                track = self._match_track(detection.centroid_x, detection.centroid_y)
+                track = self._match_track(detection.centroid_x, detection.centroid_y, used_track_ids)
                 is_new = False
                 if track is None:
                     track = self._create_track(detection.centroid_x, detection.centroid_y, frame_number, detection.confidence)
@@ -35,6 +36,7 @@ class CentroidTracker:
                     track.active = True
                     self.active_tracks[track.hole_id] = track
                     self.inactive_tracks.pop(track.hole_id, None)
+                used_track_ids.add(track.hole_id)
                 events.append(TrackEvent(track=track, detection=detection, is_new=is_new))
             self._cleanup(frame_number)
         return events
@@ -47,10 +49,13 @@ class CentroidTracker:
         self.active_tracks[hole_id] = track
         return track
 
-    def _match_track(self, x: float, y: float) -> Track | None:
+    def _match_track(self, x: float, y: float, excluded_track_ids: set[str] | None = None) -> Track | None:
         best_track: Track | None = None
         best_distance = float("inf")
+        excluded_track_ids = excluded_track_ids or set()
         for track in list(self.active_tracks.values()) + list(self.inactive_tracks.values()):
+            if track.hole_id in excluded_track_ids:
+                continue
             distance = math.hypot(x - track.centroid_x, y - track.centroid_y)
             if distance <= self.config.tracker_distance_threshold and distance < best_distance:
                 best_track = track

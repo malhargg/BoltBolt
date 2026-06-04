@@ -3,7 +3,7 @@ app:
   base_dir: .
 
 capture:
-  capture_fps: 20
+  capture_fps: 30
   reconnect_interval_seconds: 1.0
   dpi_aware: true
 
@@ -18,10 +18,20 @@ roi:
     width: 0.322
     height: 0.175
   dst:
-    x: 0.763
-    y: 0.092
-    width: 0.112
-    height: 0.030
+    x: 0.765
+    y: 0.065
+    width: 0.115
+    height: 0.032
+  location:
+    x: 0.765
+    y: 0.065
+    width: 0.115
+    height: 0.032
+  gps_location:
+    x: 0.765
+    y: 0.123
+    width: 0.135
+    height: 0.034
 
 detector:
   strategy: dash_pattern
@@ -40,12 +50,12 @@ detector:
 
 validation:
   validation_frames: 1
-  spatial_threshold_pixels: 60.0
-  max_missing_frames: 2
-  stale_after_frames: 12
+  spatial_threshold_pixels: 150.0
+  max_missing_frames: 1
+  stale_after_frames: 8
 
 tracker:
-  tracker_distance_threshold: 80.0
+  tracker_distance_threshold: 160.0
   stale_cleanup_frames: 30
   inactive_retention_frames: 500
 
